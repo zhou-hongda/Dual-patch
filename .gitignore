@@ -15,3 +15,5 @@ results/experiment_logs/
 results/predictions/
 results/visualizations/
 results/*_training_curve.png
+checkpoints/*.pt
+checkpoints/*.json

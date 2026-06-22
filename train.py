@@ -1,348 +1,111 @@
-import os
+"""Training loop for the Dual-Patch model."""
+
+from __future__ import annotations
+
+import json
 import time
+from argparse import Namespace
+from pathlib import Path
+
 import torch
-import torch.nn as nn
-import numpy as np
+from torch import nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-import matplotlib.pyplot as plt
-import evaluate
-import preprocessing
-import model
+
 from model.hybrid_model import DualStreamPatchTST
-from model.DeepESN import Model as DeepESN
-from model.RVFL import Model as RVFL
-from model.early_fusion_model import EarlyFusionPatchTST
-# 尝试导入 TSLib 模型
-try:
-    from model.InformerModel import Model as Informer
-    from model.Autoformer import Model as Autoformer
-    from model.TimesNet import Model as TimesNet
-    from model.PatchTST import Model as PatchTST
-    from model.iTransformer import Model as iTransformer
-    from model.Crossformer import Model as Crossformer
-    from model.DARNN import Model as DARNN
-    from model.hybrid_model_wo_gating import DualStreamPatchTST_wo_Gating
-    from model.DLinear import Model as DLinear
-    from model.TSMixer import Model as TSMixer
-except ImportError:
-    print("TSLib models import failed. Check file paths.")
-
-
-TSLIB_MODELS = ['Informer', 'Autoformer', 'TimesNet', 'PatchTST', 'iTransformer', 'Crossformer', 'DLinear', 'TSMixer', 'DeepESN', 'RVFL']
-
-
-class Configs:
-    """简单的配置包装类，适配 TSLib 接口"""
-    def __init__(self, args_dict):
-        for k, v in args_dict.items():
-            setattr(self, k, v)
-
-
-def create_model(model_name, config):
-    """根据名称创建模型实例"""
-
-    # === 1. TSLib 系列模型 ===
-    if model_name in TSLIB_MODELS:
-        # TSLib 模型通用参数配置
-        tslib_args_dict = {
-            'task_name': 'long_term_forecast',
-            'is_training': 1,
-            'model_id': f'{model_name}_1',
-            # 关键：输入输出维度匹配特征数量
-            'enc_in': config['input_dim'],
-            'dec_in': config['input_dim'],
-            'c_out': config['input_dim'],
-            'seq_len': config['seq_len'],
-            'label_len': config['seq_len'] // 2,
-            'pred_len': config['pred_len'],
-            # 模型结构参数
-            'd_model': 128 if model_name == 'DARNN' else 256,
-            'n_heads': 4,
-            'e_layers': 2,
-            'd_layers': 1,
-            'd_ff': 1024,
-            'dropout': config['dropout'],
-            'attn': 'prob',
-            'embed': 'timeF',
-            'activation': 'gelu',
-            'output_attention': False,
-            'freq': 'h',
-
-            # 其他特定参数
-            'factor': 3,
-            'moving_avg': 25,
-            'distil': True,
-            'top_k': 3,
-            'num_kernels': 6,
-            'patch_len': 16,
-            'stride': 8,
-            'seg_len': 6,
-            'win_size': 2,
-            'device': torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        }
-
-        tslib_args = Configs(tslib_args_dict)
-
-        if model_name == 'Informer':
-            return Informer(tslib_args)
-        elif model_name == 'Autoformer':
-            return Autoformer(tslib_args)
-        elif model_name == 'TimesNet':
-            return TimesNet(tslib_args)
-        elif model_name == 'PatchTST':
-            print("Initializing PatchTST (Hybrid Mode: Load + Daily Temp)")
-            # DailyGuidedPatchTST 需要 num_transformers 参数
-            return DualStreamPatchTST(tslib_args, config.get('num_transformers'))
-
-        # elif model_name == 'PatchTST':
-        #     print("Initializing w/o Dual-Stream (Early Fusion)")
-        #
-        #     return EarlyFusionPatchTST(tslib_args, config.get('num_transformers'))
-        # elif model_name == 'PatchTST':
-        #     print("Initializing PatchTST ")
-        #     return DualStreamPatchTST_wo_Gating(tslib_args, config.get('num_transformers'))
-        # # elif model_name == 'PatchTST':
-        # #     print("Initializing PatchTST ")
-        #     return PatchTST(tslib_args)
-        elif model_name == 'iTransformer':
-            return iTransformer(tslib_args)
-        elif model_name == 'Crossformer':
-            return Crossformer(tslib_args)
-        elif model_name == 'DARNN':
-            return DARNN(tslib_args)
-        elif model_name == 'DLinear':
-            return DLinear(tslib_args)
-        elif model_name == 'TSMixer':
-            return TSMixer(tslib_args)
-        elif model_name == 'DeepESN':
-            return DeepESN(tslib_args)
-        elif model_name == 'RVFL':
-            return RVFL(tslib_args)
-        # === 2. 常规模型 ===
-    model_classes = {
-        'MLP': model.MLPModel.MLPModel,
-        'CNN1D': model.CNN1DModel.CNN1DModel,
-        'TCN': model.TCNModel.TCNModel,
-        'RNN': model.RNNModel.RNNModel,
-        'GRU': model.GRUModel.GRUModel,
-        'LSTM': model.LSTMModel.LSTMModel,
-        'CNN-LSTM': model.CNNLSTMModel.CNNLSTMModel,
-        'Transformer-LSTM': model.TransformerLSTMModel.TransformerLSTMModel,
-
-    }
-
-    if model_name not in model_classes:
-        raise ValueError(f"Unknown model: {model_name}")
-
-    return model_classes[model_name](
-        input_dim=config['input_dim'],
-        seq_len=config['seq_len'],
-        pred_len=config['pred_len'],
-        dropout=config['dropout']
-    )
+from preprocessing import HybridDataset, load_hybrid_data
 
 
 class CombinedLoss(nn.Module):
-    """组合损失函数 (MSE + MAE)"""
-
-    def __init__(self, alpha=0.7, beta=0.3):
+    def __init__(self, mse_weight: float = 0.7) -> None:
         super().__init__()
-        self.alpha = alpha
-        self.beta = beta
-        self.mse = nn.MSELoss()
-        self.mae = nn.L1Loss()
+        self.mse_weight = mse_weight
 
-    def forward(self, pred, true):
-        return self.alpha * self.mse(pred, true) + self.beta * self.mae(pred, true)
+    def forward(self, prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        mse = nn.functional.mse_loss(prediction, target)
+        mae = nn.functional.l1_loss(prediction, target)
+        return self.mse_weight * mse + (1 - self.mse_weight) * mae
 
 
-def save_model_safely(model, model_name, epoch, test_loss, metrics, config):
-    """保存模型及配置"""
-    os.makedirs('results', exist_ok=True)
+def create_model(config: dict, num_transformers: int) -> DualStreamPatchTST:
+    model_config = Namespace(**config)
+    return DualStreamPatchTST(model_config, num_transformers)
 
-    # 准备保存字典
-    save_data = {
-        'epoch': epoch,
-        'test_loss': test_loss,
-        'metrics': metrics,
-        'config': config
+
+@torch.no_grad()
+def validation_loss(model: nn.Module, loader: DataLoader, loss_fn: nn.Module, device: torch.device) -> float:
+    model.eval()
+    losses = []
+    for inputs, targets in loader:
+        prediction = model(inputs.to(device))
+        losses.append(loss_fn(prediction, targets.to(device)).item())
+    return sum(losses) / len(losses)
+
+
+def train_model(config: dict) -> dict:
+    data = load_hybrid_data(config["data_path"], config["seq_len"], config["pred_len"])
+    train_set = HybridDataset(data.train, config["seq_len"], config["pred_len"])
+    val_set = HybridDataset(data.val, config["seq_len"], config["pred_len"])
+    if not train_set or not val_set:
+        raise ValueError("Training or validation split contains no complete windows")
+
+    loader_options = {
+        "batch_size": config["batch_size"],
+        "num_workers": config["num_workers"],
+        "pin_memory": torch.cuda.is_available(),
     }
+    train_loader = DataLoader(train_set, shuffle=True, **loader_options)
+    val_loader = DataLoader(val_set, shuffle=False, **loader_options)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = create_model(config, len(data.load_columns)).to(device)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=config["learning_rate"], weight_decay=config["weight_decay"]
+    )
+    loss_fn = CombinedLoss()
+    checkpoint = Path(config["checkpoint"])
+    checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    best_loss = float("inf")
+    history = []
 
-    if hasattr(model, 'module'):
-        save_data['model_state_dict'] = model.module.state_dict()
-    else:
-        save_data['model_state_dict'] = model.state_dict()
-
-    # 类型转换辅助函数
-    def convert_for_saving(obj):
-        if isinstance(obj, dict):
-            return {k: convert_for_saving(v) for k, v in obj.items()}
-        elif isinstance(obj, list):
-            return [convert_for_saving(v) for v in obj]
-        elif isinstance(obj, np.ndarray):
-            return obj.tolist()
-        elif isinstance(obj, (np.float32, np.float64, np.int32, np.int64)):
-            return float(obj)
-        else:
-            return obj
-
-    save_data = convert_for_saving(save_data)
-    model_path = f'results/best_{model_name}_model.pth'
-    torch.save(save_data, model_path)
-    print(f"Model saved: {model_path} (Loss: {test_loss:.6f})")
-
-
-def train_epoch(model, dataloader, optimizer, criterion, device, model_name):
-    """单轮训练逻辑"""
-    model.train()
-    total_loss = 0
-
-    for batch_x, batch_y in tqdm(dataloader, desc='Training'):
-        optimizer.zero_grad()
-        batch_y = batch_y.to(device)
-
-        # 处理不同模型的输入格式
-        if model_name in TSLIB_MODELS:
-            x_enc = batch_x['x_enc'].to(device)
-            x_mark_enc = batch_x['x_mark_enc'].to(device)
-            x_dec = batch_x['x_dec'].to(device)
-            x_mark_dec = batch_x['x_mark_dec'].to(device)
-
-            outputs = model(x_enc, x_mark_enc, x_dec, x_mark_dec)
-            if isinstance(outputs, tuple): outputs = outputs[0]
-
-            # 截断输出以匹配标签
-            if outputs.shape[1] > batch_y.shape[1]:
-                outputs = outputs[:, -batch_y.shape[1]:, :]
-        else:
-            if isinstance(batch_x, dict):
-                x_input = batch_x['x_enc'].to(device)
-            else:
-                x_input = batch_x.to(device)
-            outputs = model(x_input)
-
-        loss = criterion(outputs, batch_y)
-        loss.backward()
-        optimizer.step()
-        total_loss += loss.item()
-
-    return total_loss / len(dataloader)
-
-
-def train_model(config, model_name, transformer_ids=None):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    parameters = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
     print(f"Device: {device}")
+    print(f"Train/validation windows: {len(train_set)}/{len(val_set)}")
+    print(f"Model parameters: {parameters:,}")
 
-    # ==========================================
-    # 数据加载分支
-    # ==========================================
-    if model_name == 'PatchTST':
-        print("Using PatchTST Hybrid Data Loader (Load + Temp)...")
-        # 解包 6 个值
-        train_data, val_data, test_data, scaler, df_transformer, num_trans = preprocessing.load_hybrid_data_from_file(
-            file_path=config['data_path'], train_ratio=config['train_ratio'], val_ratio=config['val_ratio'],
-            seq_len=config['seq_len'], pred_len=config['pred_len']
-        )
-        config['num_transformers'] = num_trans
-        config['input_dim'] = num_trans
-        dates = df_transformer.index
+    for epoch in range(1, config["epochs"] + 1):
+        model.train()
+        running_loss = 0.0
+        start = time.perf_counter()
+        for inputs, targets in tqdm(train_loader, desc=f"Epoch {epoch}/{config['epochs']}"):
+            optimizer.zero_grad(set_to_none=True)
+            prediction = model(inputs.to(device))
+            loss = loss_fn(prediction, targets.to(device))
+            loss.backward()
+            optimizer.step()
+            running_loss += loss.item()
 
-        train_size = int(len(df_transformer) * config['train_ratio'])
-        val_size = int(len(df_transformer) * config['val_ratio'])
+        train_loss = running_loss / len(train_loader)
+        val_loss = validation_loss(model, val_loader, loss_fn, device)
+        elapsed = time.perf_counter() - start
+        history.append({"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss})
+        print(f"Epoch {epoch}: train={train_loss:.6f} val={val_loss:.6f} time={elapsed:.2f}s")
 
-        train_dataset = preprocessing.PatchTSTHybridDataset(
-            train_data, dates[:train_size], config['seq_len'], config['pred_len'])
-        # 验证集 Dataset
-        val_dataset = preprocessing.PatchTSTHybridDataset(
-            val_data, dates[train_size - config['seq_len']: train_size + val_size], config['seq_len'],
-            config['pred_len'])
+        if val_loss < best_loss:
+            best_loss = val_loss
+            torch.save(
+                {
+                    "model_state_dict": model.state_dict(),
+                    "model_config": {key: value for key, value in config.items() if key not in {"mode"}},
+                    "num_transformers": len(data.load_columns),
+                    "load_columns": data.load_columns,
+                    "scaler_mean": data.load_scaler.mean_,
+                    "scaler_scale": data.load_scaler.scale_,
+                    "best_val_loss": best_loss,
+                },
+                checkpoint,
+            )
 
-    else:
-        # 解包 5 个值
-        train_data, val_data, test_data, scaler, df_transformer = preprocessing.load_data_from_file(
-            file_path=config['data_path'], train_ratio=config['train_ratio'], val_ratio=config['val_ratio'],
-            seq_len=config['seq_len'], pred_len=config['pred_len']
-        )
-        config['input_dim'] = train_data.shape[1]
-        dates = df_transformer.index
-
-        train_size = int(len(df_transformer) * config['train_ratio'])
-        val_size = int(len(df_transformer) * config['val_ratio'])
-
-        if model_name in TSLIB_MODELS:
-            train_dataset = preprocessing.Dataset_TSLib(
-                train_data, dates[:train_size], config['seq_len'], config['pred_len'])
-            val_dataset = preprocessing.Dataset_TSLib(
-                val_data, dates[train_size - config['seq_len']: train_size + val_size], config['seq_len'],
-                config['pred_len'])
-        else:
-            train_dataset = preprocessing.TransformerDataset(train_data, config['seq_len'], config['pred_len'])
-            val_dataset = preprocessing.TransformerDataset(val_data, config['seq_len'], config['pred_len'])
-
-
-    train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True, drop_last=True)
-    val_loader = DataLoader(val_dataset, batch_size=config['batch_size'], shuffle=False, drop_last=False)
-
-    # ... 中间的模型初始化和优化器代码保持不变 ...
-    model = create_model(model_name, config).to(device)
-
-    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model Parameters: {total_params / 1e6:.4f} M")
-
-    if torch.cuda.device_count() > 1: model = nn.DataParallel(model)
-    optimizer = torch.optim.Adam(model.parameters(), lr=config['learning_rate'], weight_decay=config['weight_decay'])
-    criterion = CombinedLoss()
-
-    # ==========================================
-    # 核心：基于 Validation Loss 保存最佳模型
-    # ==========================================
-    best_val_loss = float('inf')
-    best_metrics = None
-    train_losses = []
-    val_losses = []
-
-    for epoch in range(config['epochs']):
-        print(f"\nEpoch {epoch + 1}/{config['epochs']}")
-
-        train_start = time.perf_counter()
-        train_loss = train_epoch(model, train_loader, optimizer, criterion, device, model_name)
-        train_time = time.perf_counter() - train_start
-        train_losses.append(train_loss)
-
-        # 验证集评估
-        infer_start = time.time()
-
-        val_metrics, _, _ = evaluate.evaluate(model, val_loader, criterion, device, model_name)
-
-        infer_time = time.time() - infer_start
-        print(f"Total Inference Time: {infer_time:.4f} seconds")
-
-        val_loss = val_metrics['overall']['loss']
-
-        val_losses.append(val_loss)
-        print(f"Training Time: {train_time:.4f} seconds")
-        print(f"Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}")
-        print(f"Val MSE: {val_metrics['overall']['mse']:.6f}, Val R2: {val_metrics['overall']['r2']:.4f}")
-
-        # 早停/最优保存：判断标准改为 val_loss
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            best_metrics = val_metrics
-            save_model_safely(model, model_name, epoch, val_loss, val_metrics, config)
-
-    # 绘制训练曲线 (Train vs Val)
-    plt.figure(figsize=(10, 5))
-    plt.plot(train_losses, label='Train Loss')
-    plt.plot(val_losses, label='Validation Loss')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.title(f'{model_name} Training Curve (Val Mode)')
-    plt.legend()
-    plt.grid(True)
-
-    os.makedirs('results', exist_ok=True)
-    plt.savefig(f'results/{model_name}_training_curve.png', dpi=300, bbox_inches='tight')
-    plt.close()
-
-    return model, scaler, best_metrics
+    history_path = checkpoint.with_suffix(".history.json")
+    history_path.write_text(json.dumps(history, indent=2), encoding="utf-8")
+    print(f"Best checkpoint: {checkpoint} (validation loss {best_loss:.6f})")
+    return {"best_val_loss": best_loss, "checkpoint": str(checkpoint)}

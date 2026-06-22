@@ -1,279 +1,112 @@
-import os
+"""Data loading for paired transformer-load and temperature time series."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import Dataset
 from sklearn.preprocessing import StandardScaler
-
-# 尝试导入时间特征工具
-try:
-    from utils.timefeatures import time_features
-except ImportError:
-    print("Warning: utils.timefeatures not found.")
+from torch.utils.data import Dataset
 
 
-class TransformerDataset(Dataset):
-    """
-    通用模型数据集 (LSTM, MLP, CNN等)
-    支持自定义步长 (Stride) 实现稀疏采样
-    """
-    def __init__(self, data, seq_len, pred_len, stride=1):
-        self.data = data
+@dataclass
+class HybridData:
+    train: tuple[np.ndarray, np.ndarray]
+    val: tuple[np.ndarray, np.ndarray]
+    test: tuple[np.ndarray, np.ndarray]
+    load_scaler: StandardScaler
+    load_columns: list[str]
+
+
+class HybridDataset(Dataset):
+    """Sliding windows with load and temperature as input, and load as target."""
+
+    def __init__(
+        self,
+        arrays: tuple[np.ndarray, np.ndarray],
+        seq_len: int,
+        pred_len: int,
+        stride: int = 1,
+    ) -> None:
+        load, temperature = arrays
+        if load.shape != temperature.shape:
+            raise ValueError(f"Load and temperature shapes differ: {load.shape} vs {temperature.shape}")
+        self.inputs = np.concatenate((load, temperature), axis=1).astype(np.float32)
+        self.targets = load.astype(np.float32)
         self.seq_len = seq_len
         self.pred_len = pred_len
         self.stride = stride
 
-    def __len__(self):
-        target_len = len(self.data) - self.seq_len - self.pred_len
-        if target_len < 0:
-            return 0
-        return target_len // self.stride + 1
+    def __len__(self) -> int:
+        windows = len(self.inputs) - self.seq_len - self.pred_len + 1
+        return max(0, (windows - 1) // self.stride + 1)
 
-    def __getitem__(self, idx):
-        start_idx = idx * self.stride
-        end_idx = start_idx + self.seq_len
-        pred_end_idx = end_idx + self.pred_len
-
-        seq = self.data[start_idx:end_idx]
-        label = self.data[end_idx:pred_end_idx]
-
-        return torch.FloatTensor(seq), torch.FloatTensor(label)
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
+        start = index * self.stride
+        split = start + self.seq_len
+        end = split + self.pred_len
+        return torch.from_numpy(self.inputs[start:split]), torch.from_numpy(self.targets[split:end])
 
 
-class Dataset_TSLib(Dataset):
-    """
-    TSLib 系列模型专用数据集 (Informer, Autoformer, iTransformer等)
-    特点: 同时返回 x_enc, x_dec, x_mark_enc, x_mark_dec
-    """
-    def __init__(self, data, dates, seq_len, pred_len, label_len=None, freq='h', stride=1):
-        self.seq_len = seq_len
-        self.pred_len = pred_len
-        self.label_len = label_len if label_len is not None else int(seq_len / 2)
-        self.stride = stride
+def load_hybrid_data(
+    file_path: str | Path,
+    seq_len: int,
+    pred_len: int,
+    train_ratio: float = 0.70,
+    val_ratio: float = 0.15,
+) -> HybridData:
+    """Load, validate, scale, and chronologically split the hybrid data."""
+    path = Path(file_path)
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"Dataset not found: {path}. See README.md for the required CSV schema."
+        )
+    if train_ratio <= 0 or val_ratio <= 0 or train_ratio + val_ratio >= 1:
+        raise ValueError("train_ratio and val_ratio must be positive and sum to less than 1")
 
-        self.data_x = data.astype(np.float32)
-        self.data_y = data.astype(np.float32)
+    frame = pd.read_csv(path)
+    date_column = "DATETIME" if "DATETIME" in frame.columns else frame.columns[0]
+    dates = pd.to_datetime(frame.pop(date_column), errors="raise")
+    if not dates.is_monotonic_increasing:
+        order = np.argsort(dates.to_numpy())
+        frame = frame.iloc[order].reset_index(drop=True)
 
-        if not isinstance(dates, pd.DatetimeIndex):
-            dates = pd.DatetimeIndex(dates)
+    load_columns = sorted(column for column in frame if not column.startswith("TEMP_"))
+    if not load_columns:
+        raise ValueError("No load columns found")
+    temp_columns = [f"TEMP_{column}" for column in load_columns]
+    missing = [column for column in temp_columns if column not in frame]
+    if missing:
+        raise ValueError(f"Missing paired temperature columns: {', '.join(missing)}")
 
-        df_stamp = pd.DataFrame({'date': dates})
-        data_stamp = time_features(pd.to_datetime(df_stamp['date'].values), freq=freq)
-        data_stamp = data_stamp.transpose(1, 0)
+    selected = frame[load_columns + temp_columns].apply(pd.to_numeric, errors="coerce")
+    if selected.isna().any().any():
+        bad = selected.columns[selected.isna().any()].tolist()
+        raise ValueError(f"Missing or non-numeric values in columns: {', '.join(bad)}")
 
-        self.data_stamp = data_stamp.astype(np.float32)
+    load = selected[load_columns].to_numpy(dtype=np.float32)
+    temperature = selected[temp_columns].to_numpy(dtype=np.float32)
+    train_end = int(len(frame) * train_ratio)
+    val_end = train_end + int(len(frame) * val_ratio)
+    minimum = seq_len + pred_len
+    if train_end < minimum or val_end - train_end < pred_len or len(frame) - val_end < pred_len:
+        raise ValueError(f"Dataset is too short for seq_len={seq_len} and pred_len={pred_len}")
 
-    def __getitem__(self, index):
-        s_begin = index * self.stride
-        s_end = s_begin + self.seq_len
-        r_begin = s_end - self.label_len
-        r_end = r_begin + self.label_len + self.pred_len
+    load_scaler = StandardScaler().fit(load[:train_end])
+    temp_scaler = StandardScaler().fit(temperature[:train_end])
+    load = load_scaler.transform(load).astype(np.float32)
+    temperature = temp_scaler.transform(temperature).astype(np.float32)
 
-        # 1. Encoder Input
-        seq_x = self.data_x[s_begin:s_end]
-        seq_x_mark = self.data_stamp[s_begin:s_end]
+    def segment(start: int, end: int) -> tuple[np.ndarray, np.ndarray]:
+        return load[start:end], temperature[start:end]
 
-        # 2. Decoder Input (Start Token + Zero Padding)
-        dec_inp_token = self.data_x[r_begin:r_begin + self.label_len]
-        dec_inp_zeros = np.zeros((self.pred_len, self.data_x.shape[-1]), dtype=np.float32)
-        seq_x_dec = np.concatenate([dec_inp_token, dec_inp_zeros], axis=0)
-
-        # 3. Decoder Time Features
-        seq_y_mark = self.data_stamp[r_begin:r_end]
-
-        # 4. Target
-        seq_y = self.data_y[s_end:s_end + self.pred_len]
-
-        return {
-            'x_enc': torch.tensor(seq_x),
-            'x_mark_enc': torch.tensor(seq_x_mark),
-            'x_dec': torch.tensor(seq_x_dec),
-            'x_mark_dec': torch.tensor(seq_y_mark)
-        }, torch.tensor(seq_y)
-
-    def __len__(self):
-        return max(0, (len(self.data_x) - self.seq_len - self.pred_len) // self.stride + 1)
-
-
-def load_data_from_file(file_path, train_ratio=0.7, val_ratio=0.15, seq_len=96, pred_len=24):
-    """【严谨修改版】常规数据加载：7:1.5:1.5 划分且彻底消除数据泄露"""
-    if not os.path.exists(file_path):
-        raise FileNotFoundError(f"数据文件不存在: {file_path}")
-
-    print(f"Loading dataset: {file_path}")
-    df = pd.read_csv(file_path)
-
-    if 'DATETIME' in df.columns:
-        df['DATETIME'] = pd.to_datetime(df['DATETIME'])
-        df.set_index('DATETIME', inplace=True)
-    else:
-        df.iloc[:, 0] = pd.to_datetime(df.iloc[:, 0])
-        df.set_index(df.columns[0], inplace=True)
-
-    data_values = df.values
-    total_len = len(data_values)
-    num_train = int(total_len * train_ratio)
-    num_val = int(total_len * val_ratio)
-
-    scaler = StandardScaler()
-    # 核心严谨约束：Scaler 必须只能在 Train 数据上进行 fit！
-    scaler.fit(data_values[:num_train])
-    data_scaled = scaler.transform(data_values)
-
-    # 严谨划分：保证验证集和测试集前面都有 seq_len 的历史窗口
-    train_data = data_scaled[:num_train]
-    val_data = data_scaled[num_train - seq_len : num_train + num_val]
-    test_data = data_scaled[num_train + num_val - seq_len :]
-
-    print(f"Data shape: Train={train_data.shape}, Val={val_data.shape}, Test={test_data.shape}")
-    return train_data, val_data, test_data, scaler, df
-
-
-def generate_processed_file(raw_path, target_ids, output_path):
-    """ETL: 筛选代表性变压器 -> 宽表转换 -> 缺失值填充"""
-    if os.path.exists(output_path):
-        print(f"Processed file exists: {output_path}")
-        return
-
-    print(f"Processing raw data: {raw_path}")
-
-    if raw_path.endswith('.csv'):
-        df = pd.read_csv(raw_path)
-    else:
-        df = pd.read_excel(raw_path)
-
-    if target_ids is not None:
-        df = df[df['TRANSFORMER_ID'].isin(target_ids)].copy()
-
-    if len(df) == 0:
-        raise ValueError("筛选后数据为空")
-
-    df['DATETIME'] = pd.to_datetime(df['DATETIME'])
-
-    # Long to Wide
-    df_pivot = df.pivot_table(index='DATETIME', columns='TRANSFORMER_ID', values='LOAD', aggfunc='mean')
-
-    # Resample & Interpolate
-    df_pivot = df_pivot.resample('1h').asfreq()
-    df_pivot = df_pivot.interpolate(method='linear').bfill().ffill()
-
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    df_pivot.to_csv(output_path)
-    print(f"Saved processed data to: {output_path}")
-
-
-def load_hybrid_data_from_file(file_path, train_ratio=0.7, val_ratio=0.15, seq_len=96, pred_len=24):
-    """
-    【严谨修改版】[PatchTST 专用] 加载混合数据 7:1.5:1.5
-    """
-    if not os.path.exists(file_path):
-        raise FileNotFoundError(f"混合数据文件不存在: {file_path}")
-
-    print(f"Loading hybrid dataset: {file_path}")
-    df = pd.read_csv(file_path)
-
-    # 索引处理
-    if 'DATETIME' in df.columns:
-        df['DATETIME'] = pd.to_datetime(df['DATETIME'])
-        df.set_index('DATETIME', inplace=True)
-    else:
-        df.iloc[:, 0] = pd.to_datetime(df.iloc[:, 0])
-        df.set_index(df.columns[0], inplace=True)
-
-    cols = df.columns
-    temp_cols = [c for c in cols if c.startswith('TEMP_')]
-    load_cols = [c for c in cols if not c.startswith('TEMP_')]
-    load_cols.sort()
-
-    expected_temp_cols = [f"TEMP_{c}" for c in load_cols]
-    final_temp_cols = []
-
-    for tc in expected_temp_cols:
-        if tc in df.columns:
-            final_temp_cols.append(tc)
-        else:
-            df[tc] = 0
-            final_temp_cols.append(tc)
-
-    df_load = df[load_cols]
-    df_temp = df[final_temp_cols]
-
-    total_len = len(df_load)
-    num_train = int(total_len * train_ratio)
-    num_val = int(total_len * val_ratio)
-
-    scaler_load = StandardScaler()
-    scaler_temp = StandardScaler()
-
-    # 核心严谨约束：Scaler 仅在 Train 拟合
-    scaler_load.fit(df_load.values[:num_train])
-    scaler_temp.fit(df_temp.values[:num_train])
-
-    data_load = scaler_load.transform(df_load.values)
-    data_temp = scaler_temp.transform(df_temp.values)
-
-    train_data = (data_load[:num_train], data_temp[:num_train])
-    val_data = (data_load[num_train - seq_len : num_train + num_val], data_temp[num_train - seq_len : num_train + num_val])
-    test_data = (data_load[num_train + num_val - seq_len :], data_temp[num_train + num_val - seq_len :])
-
-    print(f"Hybrid Load Features: {data_load.shape[1]}, Temp Features: {data_temp.shape[1]}")
-    return train_data, val_data, test_data, scaler_load, df, len(load_cols)
-
-
-class PatchTSTHybridDataset(Dataset):
-    """
-    [PatchTST 专用] 混合数据集
-    Input: [Load, Temp] (Concatenated)
-    Output: [Load] (Only)
-    """
-    def __init__(self, data_pack, dates, seq_len, pred_len, label_len=None, freq='h', stride=1):
-        self.seq_len = seq_len
-        self.pred_len = pred_len
-        self.label_len = label_len if label_len is not None else int(seq_len / 2)
-        self.stride = stride
-
-        data_load, data_temp = data_pack
-        self.num_transformers = data_load.shape[1]
-
-        # Input: Load + Temp
-        self.data_x = np.concatenate([data_load, data_temp], axis=1).astype(np.float32)
-        # Target: Load only
-        self.data_y = data_load.astype(np.float32)
-
-        if not isinstance(dates, pd.DatetimeIndex):
-            dates = pd.DatetimeIndex(dates)
-
-        df_stamp = pd.DataFrame({'date': dates})
-        data_stamp = time_features(pd.to_datetime(df_stamp['date'].values), freq=freq)
-        data_stamp = data_stamp.transpose(1, 0)
-        self.data_stamp = data_stamp.astype(np.float32)
-
-    def __getitem__(self, index):
-        s_begin = index * self.stride
-        s_end = s_begin + self.seq_len
-        r_begin = s_end - self.label_len
-        r_end = r_begin + self.label_len + self.pred_len
-
-        # Encoder Input (Load + Temp)
-        seq_x = self.data_x[s_begin:s_end]
-        seq_x_mark = self.data_stamp[s_begin:s_end]
-
-        # Decoder Input (Load only + Zeros)
-        dec_inp_token = self.data_y[r_begin:r_begin + self.label_len]
-        dec_inp_zeros = np.zeros((self.pred_len, self.num_transformers), dtype=np.float32)
-
-        seq_x_dec = np.concatenate([dec_inp_token, dec_inp_zeros], axis=0)
-        seq_y_mark = self.data_stamp[r_begin:r_end]
-
-        # Target (Load only)
-        seq_y = self.data_y[s_end:s_end + self.pred_len]
-
-        return {
-            'x_enc': torch.tensor(seq_x),
-            'x_mark_enc': torch.tensor(seq_x_mark),
-            'x_dec': torch.tensor(seq_x_dec),
-            'x_mark_dec': torch.tensor(seq_y_mark)
-        }, torch.tensor(seq_y)
-
-    def __len__(self):
-        return max(0, (len(self.data_x) - self.seq_len - self.pred_len) // self.stride + 1)
+    return HybridData(
+        train=segment(0, train_end),
+        val=segment(train_end - seq_len, val_end),
+        test=segment(val_end - seq_len, len(frame)),
+        load_scaler=load_scaler,
+        load_columns=load_columns,
+    )
