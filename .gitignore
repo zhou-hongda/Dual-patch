@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.idea/
+.agents/
+.docx_review/
+cluster/.idea/
+backup_*/
+
+# Raw transformer data is duplicated locally and each copy exceeds GitHub's
+# 100 MB file limit. Publish it through a dataset archive instead.
+data/transformer_raw.csv
+cluster/data/transformer_raw.csv
+
+results/experiment_logs/
+results/predictions/
+results/visualizations/
+results/*_training_curve.png

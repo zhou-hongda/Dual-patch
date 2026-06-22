@@ -1,4 +1,5 @@
 import os
+import time
 import numpy as np
 import pandas as pd
 import torch
@@ -13,7 +14,7 @@ plt.rcParams['axes.unicode_minus'] = False
 plt.rcParams['figure.dpi'] = 150
 
 # 模型列表
-TSLIB_MODELS = ['iTransformer', 'Crossformer', 'PatchTST', 'Informer', 'Reformer', 'Autoformer', 'TimesNet', 'DARNN']
+TSLIB_MODELS = ['iTransformer', 'Crossformer', 'PatchTST', 'Informer', 'Reformer', 'Autoformer', 'TimesNet', 'DARNN', 'DLinear', 'TSMixer','DeepESN', 'RVFL']
 
 
 def robust_inverse_transform(scaler, data_tensor, n_samples, n_timesteps, n_features):
@@ -237,7 +238,7 @@ def make_predictions(model, test_data, seq_len, pred_len, device, model_name, df
                     device)
                 x_mark_dec = torch.FloatTensor(data_stamp_dec).unsqueeze(0).to(device)
 
-                # 动态修复 1: Crossformer 输入截断
+                # Crossformer only consumes load channels.
                 if model_name != 'PatchTST' and x_enc.shape[-1] > n_real_transformers:
                     x_enc = x_enc[:, :, :n_real_transformers]
                     x_dec = x_dec[:, :, :n_real_transformers]
@@ -257,13 +258,13 @@ def make_predictions(model, test_data, seq_len, pred_len, device, model_name, df
             if isinstance(pred, tuple): pred = pred[0]
             if pred.shape[1] > pred_len: pred = pred[:, -pred_len:, :]
 
-            # 动态修复 2: 统一输出截断
+            # Keep output channels aligned with the load targets.
             if pred.shape[-1] > n_real_transformers:
                 pred = pred[:, :, :n_real_transformers]
 
             predictions.append(pred.cpu().numpy()[0])
 
-            # 动态修复 3: 真实值截断
+            # Apply the same channel selection to ground truth.
             if seq_y.shape[1] > n_real_transformers:
                 seq_y = seq_y[:, :n_real_transformers]
 
@@ -352,7 +353,7 @@ def plot_multi_model_step_comparison(all_preds, actuals, model_names, feature_na
     for f_idx in range(num_features):
         feature_name = feature_names[f_idx]
 
-        # === 核心修改 1: 根据循环索引动态生成整图的 (a), (b), (c), (d) 标号 ===
+        # Label each transformer panel in display order.
         fig_label = f"({chr(97 + f_idx)})"
 
         fig, axes = plt.subplots(1, 4, figsize=(24, 5))
@@ -374,7 +375,7 @@ def plot_multi_model_step_comparison(all_preds, actuals, model_names, feature_na
                 style = styles[m_idx % len(styles)]
                 ax.plot(pred, linestyle=style, linewidth=1.5, label=name, alpha=0.8)
 
-            # === 核心修改 2: 移除子图里的标号，只保留 Step 名字 ===
+            # Subplots show only their forecast horizon.
             ax.set_title(f'Step {step_labels[i]} (+{step_labels[i]}h)',
                          fontsize=14, fontweight='bold', pad=10)
 
@@ -386,7 +387,7 @@ def plot_multi_model_step_comparison(all_preds, actuals, model_names, feature_na
 
             ax.grid(True, alpha=0.3, linestyle='--')
 
-        # === 核心修改 3: 将 (a)(b)(c) 加到整张图片的全局大标题中 ===
+        # Put the panel label in the shared title.
         plt.suptitle(f'{fig_label} Multi-Model Comparison | Feature: {feature_name}',
                      fontsize=18, fontweight='bold', y=1.05)
 
@@ -418,7 +419,7 @@ def plot_metrics_comparison_combined(all_metrics):
     models = list(all_metrics.keys())
     unified_color = '#4c72b0'
 
-    # 优化 1：将宽度从 16 增加到 18，让 11 个模型有更充足的横向空间
+    # Extra width keeps model labels readable.
     print("Generating combined metrics comparison plot (Optimized visual)...")
     fig, axes = plt.subplots(2, 2, figsize=(18, 12))
     axes = axes.flatten()
@@ -427,7 +428,7 @@ def plot_metrics_comparison_combined(all_metrics):
         ax = axes[i]
         original_values = [all_metrics[m][met] for m in models]
 
-        # --- 核心修复：移除除以 max_val 的强制缩放，直接画真实值 ---
+        # Plot metric values directly without per-panel rescaling.
         plot_values = original_values
 
         if met == 'mse':
@@ -465,11 +466,11 @@ def plot_metrics_comparison_combined(all_metrics):
             # 统一所有指标为 4 位小数，去掉了 MAPE 的百分号以节省空间
             text_val = f'{height:.4f}'
 
-            # 优化 2：将柱子顶部的数值字号缩小到 10，并加粗 (fontweight='bold')
+            # Use compact value labels above bars.
             ax.text(bar.get_x() + bar.get_width() / 2., text_y_offset, text_val,
                     ha='center', va='bottom', fontsize=10, fontweight='bold')
 
-        # 优化 3：X 轴标签字号设为 12，加粗，并将旋转角度从 15度 增加到 30度
+        # Rotate model labels to prevent overlap.
         plt.setp(ax.get_xticklabels(), rotation=30, ha="right", fontsize=12, fontweight='bold')
         plt.setp(ax.get_yticklabels(), fontsize=12)
 
@@ -482,48 +483,37 @@ def plot_metrics_comparison_combined(all_metrics):
 # 5. 主流程
 # =========================================================
 def compare_models(model_names, config, transformer_ids=None, stride=1):
-    """
-    对比模式入口 (支持稀疏窗口 & Chronos)
-    """
+    """Evaluate multiple trained models on the same chronological test set."""
     print(f"Starting comparison: {model_names} (Stride={stride})")
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     # 1. 加载数据
-    _, test_data, scaler, df_transformer = preprocessing.load_data_from_file(
+    train_data, val_data, test_data, scaler, df_transformer = preprocessing.load_data_from_file(
         file_path=config['data_path'],
-        seq_len=config['seq_len'], pred_len=config['pred_len']
+        train_ratio=config['train_ratio'],
+        val_ratio=config.get('val_ratio', 0.15),  # 兼容保护
+        seq_len=config['seq_len'],
+        pred_len=config['pred_len']
     )
     feature_names = df_transformer.columns.tolist()
     config['input_dim'] = test_data.shape[1]
 
     all_preds_orig = {}
     all_metrics = {}
-    all_step_metrics = {}  # 新增：用于存储所有模型的分步指标
+    all_step_metrics = {}
     actuals_orig = None
 
 
     for name in model_names:
         try:
-            # === 模型加载逻辑 ===
-            if name == 'Chronos':
-                print(f"Loading Chronos (Adapter)...")
-                from chronos_adapter import ChronosAdapter
+            model = load_trained_model(name, config, device)
 
-                finetuned_path = "results/finetuned_Chronos"
-                if os.path.exists(finetuned_path):
-                    print(f"Loading finetuned weights: {finetuned_path}")
-                    model = ChronosAdapter(config, model_id=finetuned_path).to(device)
-                else:
-                    print("Using pretrained weights")
-                    model = ChronosAdapter(config).to(device)
-            else:
-                model = load_trained_model(name, config, device)
-
-            # === 预测逻辑 ===
+            infer_start = time.perf_counter()
             preds, acts = make_predictions(
                 model, test_data, config['seq_len'], config['pred_len'],
                 device, name, df_transformer, stride=stride
             )
+            print(f"{name} Test Inference Time: {time.perf_counter() - infer_start:.4f} seconds")
 
             n_samples, n_timesteps, n_features = preds.shape
 
@@ -540,7 +530,7 @@ def compare_models(model_names, config, transformer_ids=None, stride=1):
 
             all_preds_orig[name] = pred_orig
 
-            # --- 核心修改：分离指标计算 ---
+            # Overall metrics mix normalized MSE with physical-scale errors.
             # 1. 先计算基于反归一化（真实量纲）的 MAE, MAPE, R2
             metrics_orig = evaluate_metrics(pred_orig, act_orig)
 
@@ -550,7 +540,7 @@ def compare_models(model_names, config, transformer_ids=None, stride=1):
 
             all_metrics[name] = metrics_orig
             print(f"{name} Normalized MSE: {all_metrics[name]['mse']:.4f}")
-            # --- 新增：计算特定步长(1, 8, 16, 24)的分步指标 ---
+            # Report the four forecast horizons used in the manuscript.
             steps_to_eval = [0, 7, 15, 23]
             all_step_metrics[name] = evaluate_step_metrics(
                 preds, acts, pred_orig, act_orig, steps=steps_to_eval
@@ -569,7 +559,7 @@ def compare_models(model_names, config, transformer_ids=None, stride=1):
         save_dir = 'results/visualizations/comparison'
         os.makedirs(save_dir, exist_ok=True)
 
-        # 修复时间索引
+        # Align prediction windows with their first forecast timestamp.
         test_start_idx = len(df_transformer) - len(test_data)
         first_pred_time_idx = test_start_idx + config['seq_len']
 
@@ -601,7 +591,7 @@ def compare_models(model_names, config, transformer_ids=None, stride=1):
         csv_path = f'{save_dir}/all_models_comparison_step1.csv'
         df_compare.to_csv(csv_path, index=False)
         print(f"Comparison data saved to: {csv_path}")
-        # --- 新增：导出分步指标纵向对比大表格 (顶刊格式) ---
+        # Export the manuscript's vertical multi-step comparison table.
         print("Exporting multi-step metrics table (Vertical formatting)...")
 
         steps_to_eval = [0, 7, 15, 23]  # 对应真实的 Step 1, 8, 16, 24
@@ -632,6 +622,60 @@ def compare_models(model_names, config, transformer_ids=None, stride=1):
         df_step_metrics.to_csv(csv_step_path, index=False)
         print(f"Vertical multi-step metrics table saved to: {csv_step_path}")
 
+
+        # Pairwise Wilcoxon signed-rank tests on absolute errors.
+        print("\n=======================================================")
+        print("=== Statistical Significance Analysis (Wilcoxon Test) ===")
+        print("=======================================================")
+
+        from scipy.stats import wilcoxon
+
+        # 你的主打模型名称（在你的代码里 Dual-Patch 使用的名字是 PatchTST）
+        target_model = 'PatchTST'
+
+        if target_model in all_preds_orig:
+            # 获取主打模型的预测值和真实值
+            # 展平数组，计算每个预测点的绝对误差 (Absolute Error)
+            target_err = np.abs(all_preds_orig[target_model] - actuals_orig).flatten()
+
+            stat_results = []
+
+            for baseline_model in all_metrics.keys():
+                if baseline_model == target_model:
+                    continue
+                if baseline_model not in all_preds_orig:
+                    continue
+
+                # 获取基线模型的绝对误差
+                baseline_err = np.abs(all_preds_orig[baseline_model] - actuals_orig).flatten()
+
+                # 进行 Wilcoxon 符号秩检验 (单边检验: 测试 target_err 是否显著小于 baseline_err)
+                # 注意: scipy 可能会因为样本量过大而给出 warning，我们可以忽略或者正常接收
+                stat, p_value = wilcoxon(target_err, baseline_err, alternative='less')
+
+                # 判断显著性星号
+                if p_value < 0.01:
+                    sig = "*** (Highly Significant)"
+                elif p_value < 0.05:
+                    sig = "* (Significant)"
+                else:
+                    sig = "ns (Not Significant)"
+
+                print(f"[{target_model} vs {baseline_model:<15}]  p-value = {p_value:.2e}  {sig}")
+                stat_results.append(f"{target_model} vs {baseline_model}: p={p_value:.2e} {sig}")
+
+            # 将检验结果也保存到本地 TXT 文件中，方便你写论文时查阅
+            stat_file_path = f'{save_dir}/wilcoxon_test_results.txt'
+            with open(stat_file_path, 'w') as f:
+                f.write("Wilcoxon Signed-Rank Test Results\n")
+                f.write("Alternative Hypothesis: Error of target model is LESS than baseline\n")
+                f.write("-" * 50 + "\n")
+                for line in stat_results:
+                    f.write(line + "\n")
+            print(f"\nStatistical test results saved to: {stat_file_path}")
+        else:
+            print(f"Target model '{target_model}' not found in comparison list. Skipping statistical test.")
+        print("=======================================================\n")
 def predict_mode(model_name, config, transformer_ids=None, stride=1):
     """
     独立预测模式 (支持稀疏窗口)
@@ -640,8 +684,10 @@ def predict_mode(model_name, config, transformer_ids=None, stride=1):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     # 1. 加载数据
-    _, test_data, scaler, df_transformer = preprocessing.load_data_from_file(
+    train_data, val_data, test_data, scaler, df_transformer = preprocessing.load_data_from_file(
         file_path=config['data_path'],
+        train_ratio=config['train_ratio'],
+        val_ratio=config.get('val_ratio', 0.15),  # 兼容保护
         seq_len=config['seq_len'],
         pred_len=config['pred_len']
     )
@@ -658,10 +704,12 @@ def predict_mode(model_name, config, transformer_ids=None, stride=1):
         return
 
     # 3. 执行预测
+    infer_start = time.perf_counter()
     preds, acts = make_predictions(
         model, test_data, config['seq_len'], config['pred_len'],
         device, model_name, df_transformer, stride=stride
     )
+    print(f"Test Inference Time: {time.perf_counter() - infer_start:.4f} seconds")
 
     n_samples, n_timesteps, n_features = preds.shape
 
@@ -670,7 +718,7 @@ def predict_mode(model_name, config, transformer_ids=None, stride=1):
         print(f"Truncating actuals: {acts.shape[-1]} -> {n_features} columns")
         acts = acts[:, :, :n_features]
 
-    # --- 核心修改：在反归一化前，先计算归一化的 MSE ---
+    # MSE is reported on normalized data; other metrics use physical units.
     norm_mse = mean_squared_error(acts.reshape(-1), preds.reshape(-1))
 
     print("Inverse transforming...")

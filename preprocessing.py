@@ -17,7 +17,6 @@ class TransformerDataset(Dataset):
     通用模型数据集 (LSTM, MLP, CNN等)
     支持自定义步长 (Stride) 实现稀疏采样
     """
-
     def __init__(self, data, seq_len, pred_len, stride=1):
         self.data = data
         self.seq_len = seq_len
@@ -46,7 +45,6 @@ class Dataset_TSLib(Dataset):
     TSLib 系列模型专用数据集 (Informer, Autoformer, iTransformer等)
     特点: 同时返回 x_enc, x_dec, x_mark_enc, x_mark_dec
     """
-
     def __init__(self, data, dates, seq_len, pred_len, label_len=None, freq='h', stride=1):
         self.seq_len = seq_len
         self.pred_len = pred_len
@@ -97,8 +95,8 @@ class Dataset_TSLib(Dataset):
         return max(0, (len(self.data_x) - self.seq_len - self.pred_len) // self.stride + 1)
 
 
-def load_data_from_file(file_path, train_ratio=0.8, seq_len=96, pred_len=24):
-    """常规数据加载：直接读取 CSV 并标准化"""
+def load_data_from_file(file_path, train_ratio=0.7, val_ratio=0.15, seq_len=96, pred_len=24):
+    """【严谨修改版】常规数据加载：7:1.5:1.5 划分且彻底消除数据泄露"""
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"数据文件不存在: {file_path}")
 
@@ -113,15 +111,22 @@ def load_data_from_file(file_path, train_ratio=0.8, seq_len=96, pred_len=24):
         df.set_index(df.columns[0], inplace=True)
 
     data_values = df.values
+    total_len = len(data_values)
+    num_train = int(total_len * train_ratio)
+    num_val = int(total_len * val_ratio)
+
     scaler = StandardScaler()
-    data_scaled = scaler.fit_transform(data_values)
+    # 核心严谨约束：Scaler 必须只能在 Train 数据上进行 fit！
+    scaler.fit(data_values[:num_train])
+    data_scaled = scaler.transform(data_values)
 
-    train_size = int(len(data_scaled) * train_ratio)
-    train_data = data_scaled[:train_size]
-    test_data = data_scaled[train_size - seq_len:]
+    # 严谨划分：保证验证集和测试集前面都有 seq_len 的历史窗口
+    train_data = data_scaled[:num_train]
+    val_data = data_scaled[num_train - seq_len : num_train + num_val]
+    test_data = data_scaled[num_train + num_val - seq_len :]
 
-    print(f"Data shape: {data_scaled.shape}")
-    return train_data, test_data, scaler, df
+    print(f"Data shape: Train={train_data.shape}, Val={val_data.shape}, Test={test_data.shape}")
+    return train_data, val_data, test_data, scaler, df
 
 
 def generate_processed_file(raw_path, target_ids, output_path):
@@ -157,10 +162,9 @@ def generate_processed_file(raw_path, target_ids, output_path):
     print(f"Saved processed data to: {output_path}")
 
 
-def load_hybrid_data_from_file(file_path, train_ratio=0.8, seq_len=96, pred_len=24):
+def load_hybrid_data_from_file(file_path, train_ratio=0.7, val_ratio=0.15, seq_len=96, pred_len=24):
     """
-    [PatchTST 专用] 加载混合数据
-    返回: (Load_Data, Temp_Data) 元组
+    【严谨修改版】[PatchTST 专用] 加载混合数据 7:1.5:1.5
     """
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"混合数据文件不存在: {file_path}")
@@ -176,13 +180,11 @@ def load_hybrid_data_from_file(file_path, train_ratio=0.8, seq_len=96, pred_len=
         df.iloc[:, 0] = pd.to_datetime(df.iloc[:, 0])
         df.set_index(df.columns[0], inplace=True)
 
-    # 分离 Load 和 Temp 列
     cols = df.columns
     temp_cols = [c for c in cols if c.startswith('TEMP_')]
     load_cols = [c for c in cols if not c.startswith('TEMP_')]
     load_cols.sort()
 
-    # 确保每个 Load 都有对应的 Temp (没有则补0)
     expected_temp_cols = [f"TEMP_{c}" for c in load_cols]
     final_temp_cols = []
 
@@ -196,21 +198,26 @@ def load_hybrid_data_from_file(file_path, train_ratio=0.8, seq_len=96, pred_len=
     df_load = df[load_cols]
     df_temp = df[final_temp_cols]
 
-    # 分别归一化
+    total_len = len(df_load)
+    num_train = int(total_len * train_ratio)
+    num_val = int(total_len * val_ratio)
+
     scaler_load = StandardScaler()
     scaler_temp = StandardScaler()
 
-    data_load = scaler_load.fit_transform(df_load.values)
-    data_temp = scaler_temp.fit_transform(df_temp.values)
+    # 核心严谨约束：Scaler 仅在 Train 拟合
+    scaler_load.fit(df_load.values[:num_train])
+    scaler_temp.fit(df_temp.values[:num_train])
 
-    train_size = int(len(data_load) * train_ratio)
+    data_load = scaler_load.transform(df_load.values)
+    data_temp = scaler_temp.transform(df_temp.values)
 
-    # 构造返回数据
-    train_data = (data_load[:train_size], data_temp[:train_size])
-    test_data = (data_load[train_size - seq_len:], data_temp[train_size - seq_len:])
+    train_data = (data_load[:num_train], data_temp[:num_train])
+    val_data = (data_load[num_train - seq_len : num_train + num_val], data_temp[num_train - seq_len : num_train + num_val])
+    test_data = (data_load[num_train + num_val - seq_len :], data_temp[num_train + num_val - seq_len :])
 
     print(f"Hybrid Load Features: {data_load.shape[1]}, Temp Features: {data_temp.shape[1]}")
-    return train_data, test_data, scaler_load, df, len(load_cols)
+    return train_data, val_data, test_data, scaler_load, df, len(load_cols)
 
 
 class PatchTSTHybridDataset(Dataset):
@@ -219,7 +226,6 @@ class PatchTSTHybridDataset(Dataset):
     Input: [Load, Temp] (Concatenated)
     Output: [Load] (Only)
     """
-
     def __init__(self, data_pack, dates, seq_len, pred_len, label_len=None, freq='h', stride=1):
         self.seq_len = seq_len
         self.pred_len = pred_len

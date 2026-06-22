@@ -1,4 +1,5 @@
 import os
+import time
 import torch
 import torch.nn as nn
 import numpy as np
@@ -9,7 +10,9 @@ import evaluate
 import preprocessing
 import model
 from model.hybrid_model import DualStreamPatchTST
-
+from model.DeepESN import Model as DeepESN
+from model.RVFL import Model as RVFL
+from model.early_fusion_model import EarlyFusionPatchTST
 # 尝试导入 TSLib 模型
 try:
     from model.InformerModel import Model as Informer
@@ -19,10 +22,14 @@ try:
     from model.iTransformer import Model as iTransformer
     from model.Crossformer import Model as Crossformer
     from model.DARNN import Model as DARNN
+    from model.hybrid_model_wo_gating import DualStreamPatchTST_wo_Gating
+    from model.DLinear import Model as DLinear
+    from model.TSMixer import Model as TSMixer
 except ImportError:
     print("TSLib models import failed. Check file paths.")
 
-TSLIB_MODELS = ['Informer', 'Autoformer', 'TimesNet', 'PatchTST', 'iTransformer', 'Crossformer']
+
+TSLIB_MODELS = ['Informer', 'Autoformer', 'TimesNet', 'PatchTST', 'iTransformer', 'Crossformer', 'DLinear', 'TSMixer', 'DeepESN', 'RVFL']
 
 
 class Configs:
@@ -50,7 +57,7 @@ def create_model(model_name, config):
             'label_len': config['seq_len'] // 2,
             'pred_len': config['pred_len'],
             # 模型结构参数
-            'd_model': 64 if model_name == 'DARNN' else 256,
+            'd_model': 128 if model_name == 'DARNN' else 256,
             'n_heads': 4,
             'e_layers': 2,
             'd_layers': 1,
@@ -87,14 +94,32 @@ def create_model(model_name, config):
             print("Initializing PatchTST (Hybrid Mode: Load + Daily Temp)")
             # DailyGuidedPatchTST 需要 num_transformers 参数
             return DualStreamPatchTST(tslib_args, config.get('num_transformers'))
+
+        # elif model_name == 'PatchTST':
+        #     print("Initializing w/o Dual-Stream (Early Fusion)")
+        #
+        #     return EarlyFusionPatchTST(tslib_args, config.get('num_transformers'))
+        # elif model_name == 'PatchTST':
+        #     print("Initializing PatchTST ")
+        #     return DualStreamPatchTST_wo_Gating(tslib_args, config.get('num_transformers'))
+        # # elif model_name == 'PatchTST':
+        # #     print("Initializing PatchTST ")
+        #     return PatchTST(tslib_args)
         elif model_name == 'iTransformer':
             return iTransformer(tslib_args)
         elif model_name == 'Crossformer':
             return Crossformer(tslib_args)
         elif model_name == 'DARNN':
             return DARNN(tslib_args)
-
-    # === 2. 常规模型 ===
+        elif model_name == 'DLinear':
+            return DLinear(tslib_args)
+        elif model_name == 'TSMixer':
+            return TSMixer(tslib_args)
+        elif model_name == 'DeepESN':
+            return DeepESN(tslib_args)
+        elif model_name == 'RVFL':
+            return RVFL(tslib_args)
+        # === 2. 常规模型 ===
     model_classes = {
         'MLP': model.MLPModel.MLPModel,
         'CNN1D': model.CNN1DModel.CNN1DModel,
@@ -104,6 +129,7 @@ def create_model(model_name, config):
         'LSTM': model.LSTMModel.LSTMModel,
         'CNN-LSTM': model.CNNLSTMModel.CNNLSTMModel,
         'Transformer-LSTM': model.TransformerLSTMModel.TransformerLSTMModel,
+
     }
 
     if model_name not in model_classes:
@@ -213,95 +239,105 @@ def train_model(config, model_name, transformer_ids=None):
     # ==========================================
     if model_name == 'PatchTST':
         print("Using PatchTST Hybrid Data Loader (Load + Temp)...")
-
-        # 1. 混合数据加载
-        train_data, test_data, scaler, df_transformer, num_trans = preprocessing.load_hybrid_data_from_file(
-            file_path=config['data_path'],
-            train_ratio=config['train_ratio'],
-            seq_len=config['seq_len'],
-            pred_len=config['pred_len']
+        # 解包 6 个值
+        train_data, val_data, test_data, scaler, df_transformer, num_trans = preprocessing.load_hybrid_data_from_file(
+            file_path=config['data_path'], train_ratio=config['train_ratio'], val_ratio=config['val_ratio'],
+            seq_len=config['seq_len'], pred_len=config['pred_len']
         )
-
         config['num_transformers'] = num_trans
         config['input_dim'] = num_trans
-
         dates = df_transformer.index
-        train_size = len(df_transformer) * config['train_ratio']
 
-        # 2. 混合数据集
+        train_size = int(len(df_transformer) * config['train_ratio'])
+        val_size = int(len(df_transformer) * config['val_ratio'])
+
         train_dataset = preprocessing.PatchTSTHybridDataset(
-            train_data, dates[:int(train_size)], config['seq_len'], config['pred_len'])
-
-        test_dataset = preprocessing.PatchTSTHybridDataset(
-            test_data, dates[int(train_size) - config['seq_len']:], config['seq_len'], config['pred_len'])
+            train_data, dates[:train_size], config['seq_len'], config['pred_len'])
+        # 验证集 Dataset
+        val_dataset = preprocessing.PatchTSTHybridDataset(
+            val_data, dates[train_size - config['seq_len']: train_size + val_size], config['seq_len'],
+            config['pred_len'])
 
     else:
-        # 普通数据加载
-        train_data, test_data, scaler, df_transformer = preprocessing.load_data_from_file(
-            file_path=config['data_path'],
-            train_ratio=config['train_ratio'],
-            seq_len=config['seq_len'],
-            pred_len=config['pred_len']
+        # 解包 5 个值
+        train_data, val_data, test_data, scaler, df_transformer = preprocessing.load_data_from_file(
+            file_path=config['data_path'], train_ratio=config['train_ratio'], val_ratio=config['val_ratio'],
+            seq_len=config['seq_len'], pred_len=config['pred_len']
         )
-
         config['input_dim'] = train_data.shape[1]
+        dates = df_transformer.index
 
-        # 数据集构建
+        train_size = int(len(df_transformer) * config['train_ratio'])
+        val_size = int(len(df_transformer) * config['val_ratio'])
+
         if model_name in TSLIB_MODELS:
-            dates = df_transformer.index
-            train_size = len(train_data)
             train_dataset = preprocessing.Dataset_TSLib(
                 train_data, dates[:train_size], config['seq_len'], config['pred_len'])
-            test_dataset = preprocessing.Dataset_TSLib(
-                test_data, dates[train_size - config['seq_len']:], config['seq_len'], config['pred_len'])
+            val_dataset = preprocessing.Dataset_TSLib(
+                val_data, dates[train_size - config['seq_len']: train_size + val_size], config['seq_len'],
+                config['pred_len'])
         else:
             train_dataset = preprocessing.TransformerDataset(train_data, config['seq_len'], config['pred_len'])
-            test_dataset = preprocessing.TransformerDataset(test_data, config['seq_len'], config['pred_len'])
+            val_dataset = preprocessing.TransformerDataset(val_data, config['seq_len'], config['pred_len'])
 
-    # DataLoader
+
     train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True, drop_last=True)
-    test_loader = DataLoader(test_dataset, batch_size=config['batch_size'], shuffle=False, drop_last=False)
+    val_loader = DataLoader(val_dataset, batch_size=config['batch_size'], shuffle=False, drop_last=False)
 
-    # 模型初始化
+    # ... 中间的模型初始化和优化器代码保持不变 ...
     model = create_model(model_name, config).to(device)
 
-    if torch.cuda.device_count() > 1:
-        model = nn.DataParallel(model)
+    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Model Parameters: {total_params / 1e6:.4f} M")
 
+    if torch.cuda.device_count() > 1: model = nn.DataParallel(model)
     optimizer = torch.optim.Adam(model.parameters(), lr=config['learning_rate'], weight_decay=config['weight_decay'])
     criterion = CombinedLoss()
 
-    # 训练循环
-    best_test_loss = float('inf')
+    # ==========================================
+    # 核心：基于 Validation Loss 保存最佳模型
+    # ==========================================
+    best_val_loss = float('inf')
     best_metrics = None
     train_losses = []
-    test_losses = []
+    val_losses = []
 
     for epoch in range(config['epochs']):
         print(f"\nEpoch {epoch + 1}/{config['epochs']}")
 
+        train_start = time.perf_counter()
         train_loss = train_epoch(model, train_loader, optimizer, criterion, device, model_name)
+        train_time = time.perf_counter() - train_start
         train_losses.append(train_loss)
 
-        test_metrics, _, _ = evaluate.evaluate(model, test_loader, criterion, device, model_name)
-        test_loss = test_metrics['overall']['loss']
-        test_losses.append(test_loss)
+        # 验证集评估
+        infer_start = time.time()
 
-        print(f"Train Loss: {train_loss:.6f}, Test Loss: {test_loss:.6f}")
-        print(f"MSE: {test_metrics['overall']['mse']:.6f}, R2: {test_metrics['overall']['r2']:.4f}")
+        val_metrics, _, _ = evaluate.evaluate(model, val_loader, criterion, device, model_name)
 
-        if test_loss < best_test_loss:
-            best_test_loss = test_loss
-            best_metrics = test_metrics
-            save_model_safely(model, model_name, epoch, test_loss, test_metrics, config)
+        infer_time = time.time() - infer_start
+        print(f"Total Inference Time: {infer_time:.4f} seconds")
 
-    # 绘制训练曲线
+        val_loss = val_metrics['overall']['loss']
+
+        val_losses.append(val_loss)
+        print(f"Training Time: {train_time:.4f} seconds")
+        print(f"Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}")
+        print(f"Val MSE: {val_metrics['overall']['mse']:.6f}, Val R2: {val_metrics['overall']['r2']:.4f}")
+
+        # 早停/最优保存：判断标准改为 val_loss
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_metrics = val_metrics
+            save_model_safely(model, model_name, epoch, val_loss, val_metrics, config)
+
+    # 绘制训练曲线 (Train vs Val)
     plt.figure(figsize=(10, 5))
     plt.plot(train_losses, label='Train Loss')
-    plt.plot(test_losses, label='Test Loss')
+    plt.plot(val_losses, label='Validation Loss')
     plt.xlabel('Epoch')
     plt.ylabel('Loss')
-    plt.title(f'{model_name} Training Curve')
+    plt.title(f'{model_name} Training Curve (Val Mode)')
     plt.legend()
     plt.grid(True)
 
